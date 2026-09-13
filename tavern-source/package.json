@@ -1,0 +1,52 @@
+{
+  "name": "dsh-profile-tavern",
+  "version": "1.7.0",
+  "private": true,
+  "bin": {
+    "dsh-tavern": "bin/dsh-tavern.mjs"
+  },
+  "scripts": {
+    "build:client": "node bin/build-tavern-client.mjs",
+    "check:client": "node bin/build-tavern-client.mjs --check",
+    "docs:build": "node docs/manual/build.mjs",
+    "docs:dev": "node docs/manual/build.mjs && python3 -m http.server 4173 --bind 127.0.0.1 --directory docs",
+    "test:docs": "node --test tests/manual-site.test.mjs tests/product-site.test.mjs tests/manual-pages.test.mjs",
+    "build:image-gen": "pnpm --dir tavern-plugin/packages/dsh-image-gen run build",
+    "test:image-gen": "pnpm --dir tavern-plugin/packages/dsh-image-gen test",
+    "install:tavern": "node ./bin/dsh-tavern.mjs install",
+    "start:tavern": "node ./bin/dsh-tavern.mjs start",
+    "stop:tavern": "node ./bin/dsh-tavern.mjs stop",
+    "restart:tavern": "node ./bin/dsh-tavern.mjs restart",
+    "status:tavern": "node ./bin/dsh-tavern.mjs status",
+    "test": "node bin/test-tavern.mjs",
+    "test:play": "node testsets/test-play.mjs"
+  },
+  "dependencies": {
+    "@jitl/quickjs-singlefile-mjs-release-sync": "0.32.0",
+    "acorn": "8.15.0",
+    "chevrotain": "^11.2.0",
+    "dsh-better-sidebar": "0.17.1",
+    "dsh-tavern-plugin": "link:./tavern-plugin",
+    "dsh-tavern-remote": "link:./tavern-plugin/packages/dsh-tavern-remote",
+    "dsh-web-mobile": "2.3.0",
+    "ejs": "3.1.9",
+    "mathjs": "12.4.3",
+    "quickjs-emscripten-core": "0.32.0",
+    "yaml": "2.9.0"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "dsh-web-mobile",
+        "dsh-better-sidebar",
+        "dsh-tavern-plugin",
+        "dsh-tavern-remote"
+      ]
+    }
+  },
+  "devDependencies": {
+    "playwright": "1.58.2"
+  }
+}

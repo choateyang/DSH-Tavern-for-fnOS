@@ -1,0 +1,312 @@
+$ErrorActionPreference = 'Stop'
+
+$InstallHost = if ($env:DSH_TAVERN_HOST) { $env:DSH_TAVERN_HOST } else { 'cli' }
+if ($InstallHost -notin @('cli', 'desktop')) { throw "不支持的安装宿主：$InstallHost" }
+
+$Repository = if ($env:DSH_TAVERN_REPOSITORY) { $env:DSH_TAVERN_REPOSITORY } else { 'flizzywine/dsh-tavern' }
+$RepositoryUrl = if ($env:DSH_TAVERN_GIT_URL) { $env:DSH_TAVERN_GIT_URL } else { "https://github.com/$Repository.git" }
+$ArchiveUrl = if ($env:DSH_TAVERN_ARCHIVE_URL) { $env:DSH_TAVERN_ARCHIVE_URL } else { "https://codeload.github.com/$Repository/zip/refs/heads/main" }
+$CommitUrl = if ($env:DSH_TAVERN_COMMIT_URL) { $env:DSH_TAVERN_COMMIT_URL } else { "https://api.github.com/repos/$Repository/commits/main" }
+$CdnMetadataUrl = if ($env:DSH_TAVERN_CDN_METADATA_URL) { $env:DSH_TAVERN_CDN_METADATA_URL } else { "https://cdn.jsdelivr.net/gh/$Repository@main/dsh-tavern-runtime.json" }
+$CdnRootUrl = if ($env:DSH_TAVERN_CDN_ROOT_URL) { $env:DSH_TAVERN_CDN_ROOT_URL.TrimEnd('/') } else { "https://cdn.jsdelivr.net/gh/$Repository" }
+$DshRoot = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh' }
+$LegacyDshRoot = if ($env:DSH_TAVERN_LEGACY_DSH_HOME) { $env:DSH_TAVERN_LEGACY_DSH_HOME } else { $DshRoot }
+if ($InstallHost -eq 'cli') {
+  # CLI directory selection: explicit paths and existing installations never prompt.
+  $DefaultCliRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh-tavern'
+  $CurrentCliRoot = (Get-Location).ProviderPath
+  $DshRoot = $env:DSH_TAVERN_CLI_HOME
+  if (-not $DshRoot) {
+    if ((Test-Path -LiteralPath (Join-Path $CurrentCliRoot 'apps/dsh-tavern/.dsh-tavern-local.json') -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $CurrentCliRoot '.dsh-tavern-install-root') -PathType Leaf)) { $DshRoot = $CurrentCliRoot }
+    elseif ((Test-Path -LiteralPath (Join-Path $DefaultCliRoot 'apps/dsh-tavern/.dsh-tavern-local.json') -PathType Leaf) -or (Test-Path -LiteralPath (Join-Path $DefaultCliRoot '.dsh-tavern-install-root') -PathType Leaf)) { $DshRoot = $DefaultCliRoot }
+    else {
+      if ([Console]::IsInputRedirected) { throw '无法交互选择安装目录。请设置 DSH_TAVERN_CLI_HOME 后重新运行。' }
+      Write-Host "请选择 CLI 安装目录：`n  1. 默认目录：$DefaultCliRoot`n  2. 当前目录：$CurrentCliRoot（回车默认）`n  3. 其他目录"
+      Write-Host '程序、运行时和游戏数据存入所选目录；命令入口和包管理器缓存可能位于目录外。'
+      while (-not $DshRoot) {
+        $Choice = Read-Host '请选择 [1/2/3，默认 2]'
+        switch ($Choice) {
+          '1' { $DshRoot = $DefaultCliRoot }
+          '2' { $DshRoot = $CurrentCliRoot }
+          '' { $DshRoot = $CurrentCliRoot }
+          '3' {
+            $SelectedCliRoot = Read-Host '请输入完整安装路径'
+            if ($SelectedCliRoot -match '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)') { $DshRoot = $SelectedCliRoot }
+            else { Write-Host '请输入完整路径，例如 D:\Games\dsh-tavern。' }
+          }
+          default { Write-Host '请输入 1、2 或 3。' }
+        }
+      }
+    }
+  }
+  $DshRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DshRoot)
+  if (-not (Test-Path -LiteralPath (Join-Path $DshRoot 'apps/dsh-tavern/.dsh-tavern-local.json') -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $DshRoot '.dsh-tavern-install-root') -PathType Leaf)) {
+    foreach ($Entry in @('apps', 'runtime', 'tools', 'profiles', 'profile-data', 'source-cache', 'logs', 'backups', 'settings.yaml')) {
+      if (Test-Path -LiteralPath (Join-Path $DshRoot $Entry)) { throw "安装目录存在冲突：$DshRoot\$Entry。请选择空目录，或使用原有安装目录。" }
+    }
+  }
+  Write-Host "CLI 安装目录：$DshRoot"
+  New-Item -ItemType Directory -Force -Path $DshRoot | Out-Null
+  Set-Content -LiteralPath (Join-Path $DshRoot '.dsh-tavern-install-root') -Value 'cli-v1'
+}
+
+$AppDir = if ($env:DSH_TAVERN_APP_DIR) { $env:DSH_TAVERN_APP_DIR } else { Join-Path $DshRoot 'apps\dsh-tavern' }
+$RuntimeRoot = Join-Path $DshRoot 'tools'
+$PnpmVersion = '11.25.0'
+$CommandBin = Join-Path $DshRoot 'bin'
+$SourceCache = Join-Path $DshRoot 'source-cache\dsh-tavern.git'
+$TempDir = Join-Path ([IO.Path]::GetTempPath()) ("dsh-tavern-install-" + [Guid]::NewGuid().ToString('N'))
+$TargetCommit = if ($env:DSH_TAVERN_TARGET_COMMIT) { $env:DSH_TAVERN_TARGET_COMMIT } else { '' }
+$RuntimePaths = @(
+  'package.json',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+  'cordis.patch.yml',
+  'install.ps1',
+  'install.sh',
+  'bin',
+  'config',
+  'presets',
+  'tavern-plugin',
+  'patches'
+)
+
+function Test-Command([string]$Name) {
+  return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Resolve-Command([string]$Name) {
+  $WindowsShim = Get-Command "$Name.cmd" -ErrorAction SilentlyContinue
+  if ($null -ne $WindowsShim) { return $WindowsShim.Source }
+  $Command = Get-Command $Name -ErrorAction SilentlyContinue
+  if ($null -ne $Command) { return $Command.Source }
+  return $null
+}
+
+function Assert-LastCommand([string]$Message) {
+  if ($LASTEXITCODE -ne 0) { throw $Message }
+}
+
+$PreviousDshHome = $env:DSH_HOME
+$PreviousCliHome = $env:DSH_TAVERN_CLI_HOME
+$PreviousLegacyHome = $env:DSH_TAVERN_LEGACY_DSH_HOME
+$PreviousPath = $env:Path
+$PreviousNpmRegistry = $env:npm_config_registry
+$PreviousPnpmRegistry = $env:pnpm_config_registry
+try {
+  $env:DSH_HOME = $DshRoot
+  if ($InstallHost -eq 'cli') {
+    $env:DSH_TAVERN_CLI_HOME = $DshRoot
+    $env:DSH_TAVERN_LEGACY_DSH_HOME = $LegacyDshRoot
+  }
+  # Child npm/pnpm processes, including Profile and plugin installs, inherit this.
+  $env:npm_config_registry = if ($env:DSH_TAVERN_NPM_REGISTRY) { $env:DSH_TAVERN_NPM_REGISTRY } else { 'https://registry.npmmirror.com' }
+  # pnpm 11 reads pnpm_config_* instead of npm_config_*.
+  $env:pnpm_config_registry = $env:npm_config_registry
+  if (-not (Test-Command 'node')) {
+    Start-Process 'https://nodejs.org/'
+    throw '未找到 Node.js。请安装 Node.js 22.19 或更高版本，然后重新运行本命令。'
+  }
+
+  $NodeVersionText = (& node --version).Trim()
+  $NodeVersion = [version]$NodeVersionText.TrimStart('v')
+  if ($NodeVersion -lt [version]'22.19.0') {
+    throw "Node.js 版本过低，需要 22.19 或更高版本（当前：$NodeVersionText）。"
+  }
+  $GitCommand = Resolve-Command 'git'
+  $NpmCommand = Resolve-Command 'npm'
+  if ($InstallHost -eq 'cli' -and $null -eq $NpmCommand) { throw '未找到 npm，请重新安装 Node.js。' }
+
+  if ($InstallHost -eq 'cli') {
+    $env:Path = "$RuntimeRoot;$env:Path"
+    $env:DSH_TAVERN_BIN_DIR = $CommandBin
+    $env:Path = "$CommandBin;$env:Path"
+    $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $UserEntries = @($UserPath -split ';' | Where-Object { $_ -ne '' })
+    if (-not ($UserEntries | Where-Object { $_.TrimEnd('\') -ieq $CommandBin.TrimEnd('\') })) {
+      $NewUserPath = (@($UserEntries) + $CommandBin) -join ';'
+      [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
+    }
+  }
+
+  New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+  $ArchivePath = Join-Path $TempDir 'app.zip'
+  $ExtractDir = Join-Path $TempDir 'extract'
+  $UsedGit = $false
+  $UsedCdn = $false
+  if ($null -ne $GitCommand) {
+    try {
+      Write-Host '正在通过 Git 增量同步 DSH Tavern（不下载文档与图片）……'
+      New-Item -ItemType Directory -Force -Path (Split-Path $SourceCache -Parent) | Out-Null
+      if (-not (Test-Path (Join-Path $SourceCache 'HEAD'))) {
+        & $GitCommand clone --bare --filter=blob:none --depth 1 --single-branch --branch main $RepositoryUrl $SourceCache
+        Assert-LastCommand 'DSH Tavern Git 缓存初始化失败。'
+      }
+      & $GitCommand --git-dir=$SourceCache remote set-url origin $RepositoryUrl
+      Assert-LastCommand 'DSH Tavern Git 远程地址配置失败。'
+      & $GitCommand --git-dir=$SourceCache fetch --depth 1 origin main
+      Assert-LastCommand 'DSH Tavern 增量更新失败。'
+      $TargetCommit = (& $GitCommand --git-dir=$SourceCache rev-parse FETCH_HEAD).Trim()
+      Assert-LastCommand 'DSH Tavern 提交号读取失败。'
+      & $GitCommand -c core.autocrlf=false -c core.eol=lf --git-dir=$SourceCache archive --format=zip "--output=$ArchivePath" FETCH_HEAD -- @RuntimePaths
+      Assert-LastCommand 'DSH Tavern 精简运行包生成失败。'
+      $UsedGit = $true
+    }
+    catch {
+      Write-Warning ("Git 增量更新不可用，将回退到完整 ZIP：" + $_.Exception.Message)
+    }
+  }
+  if (-not $UsedGit) {
+    try {
+      Write-Host 'GitHub 直连不可用，正在通过 jsDelivr 备用源下载运行代码……'
+      $CdnSource = Join-Path $TempDir 'cdn-source'
+      New-Item -ItemType Directory -Force -Path $CdnSource | Out-Null
+      $Metadata = Invoke-RestMethod -UseBasicParsing -Uri $CdnMetadataUrl -TimeoutSec 15
+      if ([string]$Metadata.revision -notmatch '^[0-9a-fA-F]{40}$') { throw 'jsDelivr 运行清单缺少有效提交号。' }
+      $RuntimePattern = '^(package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|cordis\.patch\.yml|install\.ps1|install\.sh|bin/|config/|presets/|tavern-plugin/|patches/)'
+      $Files = @($Metadata.files | Where-Object { $_.path -match $RuntimePattern -and $_.path -notmatch '(^|/)\.\.(/|$)' -and $_.sha256 -match '^[0-9a-fA-F]{64}$' })
+      if ($Files.Count -eq 0) { throw 'jsDelivr 未返回运行文件清单。' }
+      foreach ($File in $Files) {
+        $RelativePath = $File.path.Replace('/', [IO.Path]::DirectorySeparatorChar)
+        $Target = Join-Path $CdnSource $RelativePath
+        New-Item -ItemType Directory -Force -Path (Split-Path $Target -Parent) | Out-Null
+        Invoke-WebRequest -UseBasicParsing -Uri ("$CdnRootUrl@$($Metadata.revision)/$($File.path)") -OutFile $Target -TimeoutSec 30
+        $ActualHash = (Get-FileHash -LiteralPath $Target -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($ActualHash -ne ([string]$File.sha256).ToLowerInvariant()) { throw "jsDelivr 文件校验失败：$($File.path)" }
+      }
+      [IO.File]::WriteAllText((Join-Path $CdnSource 'dsh-tavern-runtime.json'), (($Metadata | ConvertTo-Json -Depth 10) + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
+      $TargetCommit = [string]$Metadata.revision
+      $UsedCdn = $true
+    }
+    catch {
+      Write-Warning ("jsDelivr 备用源不可用，将回退到完整 ZIP：" + $_.Exception.Message)
+    }
+  }
+  if (-not $UsedGit -and -not $UsedCdn) {
+    Write-Host '正在下载完整 ZIP……'
+    $PreviousProgressPreference = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+      if ($TargetCommit -eq '') {
+        try { $TargetCommit = (Invoke-RestMethod -UseBasicParsing -Uri $CommitUrl -Headers @{ Accept = 'application/vnd.github+json' }).sha }
+        catch { Write-Warning '无法记录当前提交号，不影响本次安装。' }
+      }
+      for ($Attempt = 1; $Attempt -le 3; $Attempt++) {
+        try {
+          Invoke-WebRequest -UseBasicParsing -Uri $ArchiveUrl -OutFile $ArchivePath
+          break
+        }
+        catch {
+          if ($Attempt -eq 3) { throw }
+          Write-Host "下载失败，正在重试（$Attempt/3）……"
+          Start-Sleep -Seconds 2
+        }
+      }
+    }
+    finally {
+      $ProgressPreference = $PreviousProgressPreference
+    }
+  }
+  if (-not $UsedCdn) {
+    New-Item -ItemType Directory -Force -Path $ExtractDir | Out-Null
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractDir -Force
+  }
+  $SourceDir = if ($UsedCdn) {
+    Get-Item -LiteralPath $CdnSource
+  } elseif ($UsedGit) {
+    Get-Item -LiteralPath $ExtractDir
+  } else {
+    Get-ChildItem -LiteralPath $ExtractDir -Directory | Select-Object -First 1
+  }
+  if ($null -eq $SourceDir) { throw '下载内容不完整。' }
+  if (-not (Test-Path (Join-Path $SourceDir.FullName 'package.json'))) {
+    throw '下载内容不完整。'
+  }
+
+  # Read compatibility from the downloaded release before installing missing tools.
+  $CompatibilityScript = Join-Path $SourceDir.FullName 'bin\dsh-compatibility.mjs'
+  $AdaptedDshVersion = (& node $CompatibilityScript --version)
+  Assert-LastCommand '读取 DSH 适配版本失败。'
+  $AdaptedDshVersion = $AdaptedDshVersion.Trim()
+  & node $CompatibilityScript --notice $InstallHost
+  Assert-LastCommand '读取 DSH 兼容提示失败。'
+  $MissingPackages = @()
+  $PnpmCommand = Resolve-Command 'pnpm'
+  $PnpmNeedsInstall = $false
+  if ($InstallHost -eq 'cli') {
+    if ($null -eq $PnpmCommand) {
+      $PnpmNeedsInstall = $true
+    }
+    else {
+      try { $PnpmNeedsInstall = ((& $PnpmCommand --version).Trim() -ne $PnpmVersion) }
+      catch { $PnpmNeedsInstall = $true }
+    }
+  }
+  if ($PnpmNeedsInstall) { $MissingPackages += "pnpm@$PnpmVersion" }
+  if ($MissingPackages.Count -gt 0) {
+    Write-Host ("正在安装缺失依赖：" + ($MissingPackages -join '、') + '……')
+    New-Item -ItemType Directory -Force -Path $RuntimeRoot | Out-Null
+    & $NpmCommand install --global --prefix $RuntimeRoot @MissingPackages
+    Assert-LastCommand 'pnpm 或 DeepSeek Harness 安装失败。'
+  }
+  $PnpmCommand = Resolve-Command 'pnpm'
+  if ($null -eq $PnpmCommand) { throw '未找到 pnpm。Desktop 版请从 DSH Desktop 托盘打开 DSH Terminal 后运行本命令。' }
+  $DshCommand = Resolve-Command 'dsh'
+  if ($InstallHost -ne 'cli' -and $null -eq $DshCommand) { throw '未找到 DSH。Desktop 版请从 DSH Desktop 托盘打开 DSH Terminal 后运行本命令。' }
+
+  # Validate before replacing any installed application files.
+  if ($InstallHost -ne 'cli') {
+    $CurrentDshVersion = (& $DshCommand --version)
+    Assert-LastCommand '无法读取宿主 DSH 版本。'
+    & node $CompatibilityScript --check $InstallHost ($CurrentDshVersion -join "`n")
+    Assert-LastCommand '宿主 DSH 版本不兼容，尚未覆盖程序文件。'
+  }
+
+  $OldLauncher = Join-Path $AppDir 'bin\dsh-tavern.mjs'
+  if ($InstallHost -eq 'cli' -and (Test-Path $OldLauncher)) {
+    & node $OldLauncher stop *> $null
+  }
+
+  New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+  # 覆盖程序文件但不删除旧目录，因此未被发布包跟踪的 data\ 用户数据会保留。
+  Get-ChildItem -LiteralPath $SourceDir.FullName -Force | Copy-Item -Destination $AppDir -Recurse -Force
+  if ($UsedCdn -and (Test-Path (Join-Path $AppDir '.dsh-tavern-release.json'))) {
+    Remove-Item -LiteralPath (Join-Path $AppDir '.dsh-tavern-release.json') -Force
+  }
+  if ($TargetCommit -match '^[0-9a-fA-F]{40}$') {
+    $ReleaseJson = @{ commit = $TargetCommit; installedAt = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json
+    [IO.File]::WriteAllText((Join-Path $AppDir '.dsh-tavern-release.json'), $ReleaseJson, (New-Object Text.UTF8Encoding($false)))
+  }
+
+  Write-Host '正在安装程序依赖……'
+  & $PnpmCommand --dir $AppDir install --frozen-lockfile
+  Assert-LastCommand '程序依赖安装失败。'
+
+  Write-Host '正在配置 Tavern……'
+  & node (Join-Path $AppDir 'bin\dsh-tavern.mjs') install --host $InstallHost
+  Assert-LastCommand 'Tavern profile 安装失败。'
+  if ($InstallHost -eq 'desktop') {
+    Write-Host 'DSH Tavern Desktop 版安装完成。'
+    Write-Host '请重启 DSH Desktop，再从托盘的 Profile 菜单切换到 tavern。'
+  }
+  else {
+    & node (Join-Path $AppDir 'bin\dsh-tavern.mjs') start
+    Assert-LastCommand 'DSH Tavern 启动失败。'
+    Write-Host 'DSH Tavern 安装完成。请使用上方完整访问地址，或运行 dsh-tavern open 打开网页。'
+    Write-Host '以后可以使用：dsh-tavern start、open、stop、restart、status、update（新 PowerShell 生效）'
+  }
+}
+catch {
+  throw ("安装失败：" + $_.Exception.Message)
+}
+finally {
+  $env:npm_config_registry = $PreviousNpmRegistry
+  $env:pnpm_config_registry = $PreviousPnpmRegistry
+  $env:DSH_HOME = $PreviousDshHome
+  $env:DSH_TAVERN_CLI_HOME = $PreviousCliHome
+  $env:DSH_TAVERN_LEGACY_DSH_HOME = $PreviousLegacyHome
+  $env:Path = $PreviousPath
+  if (Test-Path $TempDir) {
+    Remove-Item -LiteralPath $TempDir -Recurse -Force
+  }
+}
