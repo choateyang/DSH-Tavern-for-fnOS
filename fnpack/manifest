@@ -1,0 +1,13 @@
+appname               = dsh.tavern
+version               = 1.0.0
+display_name          = DSH Tavern
+desc                  = DSH Tavern 管理应用，支持服务启动、停止、重启、更新与强制重建。<br/>提供工作区查看、实时日志、飞牛统一网关、HTTP/HTTPS 反向代理、访问密码和网络代理配置。
+platform              = x86
+source                = thirdparty
+install_dep_apps      = nodejs_v24
+maintainer            = flizzywine
+distributor           = choateyang
+distributor_url       = https://github.com/choateyang
+desktop_uidir         = ui
+desktop_applaunchname = dsh.tavern.Application
+micro_app             = true

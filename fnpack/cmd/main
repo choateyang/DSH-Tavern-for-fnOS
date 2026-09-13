@@ -1,0 +1,141 @@
+#!/bin/bash
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+# 根据应用数据位置选项决定路径
+LIB_TYPE="${wizard_data_library_type:-data}"
+if [ "${LIB_TYPE}" = "data" ]; then
+    DATA_LIBRARY_PATH="${TRIM_PKGVAR}"
+else
+    DATA_LIBRARY_PATH="${TRIM_DATA_SHARE_PATHS%%:*}"
+fi
+
+DSH_RUN_USER="${wizard_dsh_run_user:-root}"
+[ "${DSH_RUN_USER}" = "package" ] && DSH_RUN_USER="dsh.tavern"
+
+export DATA_LIBRARY_PATH="${DATA_LIBRARY_PATH}"
+export DSH_RUN_USER="${DSH_RUN_USER}"
+
+CMD="${TRIM_APPDEST}/bin/dsh.tavern"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] $1" >> ${LOG_FILE}
+}
+
+log_err() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $1" >> ${LOG_FILE}
+}
+
+start_process() {
+    if status; then
+        return 0
+    fi
+
+    log_msg "正在启动 dsh.tavern 应用进程 (CMD=${CMD}, DATA_LIBRARY_PATH=${DATA_LIBRARY_PATH}, DSH_RUN_USER=${DSH_RUN_USER})..."
+    if [ "${DSH_RUN_USER}" != "root" ] && id "${DSH_RUN_USER}" >/dev/null 2>&1; then
+        su -s /bin/bash "${DSH_RUN_USER}" -c "${CMD}" &
+    else
+        bash -c "${CMD}" &
+    fi
+    local pid=$!
+    printf "%s" "${pid}" > ${PID_FILE}
+
+    sleep 1
+    if ! check_process "${pid}"; then
+        log_err "应用进程启动失败 (进程 PID: ${pid} 意外退出)。"
+        rm -f "${PID_FILE}"
+        return 1
+    fi
+
+    return 0
+}
+
+stop_process() {
+    log_msg "正在停止 dsh.tavern 应用进程..."
+
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if check_process "${pid}"; then
+            log_msg "向主进程 PID: ${pid} 发送 SIGTERM 停止信号..."
+            kill -TERM "${pid}" >> ${LOG_FILE} 2>&1
+
+            local count=0
+            while check_process "${pid}" && [ $count -lt 5 ]; do
+                sleep 1
+                count=$((count + 1))
+            done
+
+            if check_process "${pid}"; then
+                log_err "主进程 PID: ${pid} 未在 5 秒内停止，发送 SIGKILL。"
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    # 兜底清理：dsh-tavern.pid 记录的子进程组
+    local h_pid_file="${DATA_LIBRARY_PATH}/dsh-tavern.pid"
+    if [ -r "${h_pid_file}" ]; then
+        local h_pid=$(cat "${h_pid_file}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${h_pid}" ]; then
+            kill -9 -"${h_pid}" 2>/dev/null || true
+            kill -9 "${h_pid}" 2>/dev/null || true
+        fi
+        rm -f "${h_pid_file}"
+    fi
+
+    # 兜底清理：清理属于本应用所有可能目录的残留进程
+    pkill -9 -f "${TRIM_PKGVAR}" 2>/dev/null || true
+
+    SHARE_PATH="${TRIM_DATA_SHARE_PATHS%%:*}"
+    if [ -n "${SHARE_PATH}" ]; then
+        pkill -9 -f "${SHARE_PATH}" 2>/dev/null || true
+    fi
+
+    rm -f "${TRIM_APPDEST}/web.sock"
+
+    log_msg "应用进程及残留已完全停止。"
+    return 0
+}
+
+check_process() {
+    local pid=$1
+    if kill -0 "${pid}" 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if check_process "${pid}"; then
+            return 0
+        else
+            rm -f "${PID_FILE}"
+        fi    
+    fi
+
+    return 1
+}
+
+case $1 in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then 
+        exit 0
+    else 
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

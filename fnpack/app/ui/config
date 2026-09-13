@@ -1,0 +1,30 @@
+{
+    ".url": {
+        "dsh.tavern.Application": {
+            "title": "DSH Tavern 管理器",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "gatewaySocket": "web.sock",
+            "gatewayPrefix": "/app/dsh-tavern",
+            "url": "/app/dsh-tavern/",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly",
+                "fullUrlPerm": "readonly",
+                "portPerm": "readonly",
+                "pathPerm": "readonly"
+            }
+        },
+        "dsh.tavern.ui.Application": {
+            "title": "DSH Tavern WebUI",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "http",
+            "gatewaySocket": "web.sock",
+            "gatewayPrefix": "/app/dsh-tavern",
+            "url": "/app/dsh-tavern/fngateway/",
+            "allUsers": false
+        }
+    }
+}
