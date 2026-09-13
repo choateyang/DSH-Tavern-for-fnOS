@@ -1,0 +1,840 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"html/template"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/soheilhy/cmux"
+)
+
+//go:embed templates/auth_login.html
+var authLoginPageTplContent string
+
+//go:embed templates/pwa-icon.svg
+var pwaIconSvgBytes []byte
+
+var authLoginPageTpl = template.Must(template.New("auth_login").Parse(authLoginPageTplContent))
+
+const (
+	authCookieName      = "dsh_tavern_session"
+	authLegacyCookie    = "dsh_tavern_auth"
+	authLoginPath       = "/_dsh_tavern_auth"
+	authMaxAttempts     = 3
+	authLockoutDuration = 1 * time.Hour
+	dshExchangeCookie   = "_dsh_exch"
+)
+
+type clientAuthStatus struct {
+	failedCount int
+	lockUntil   time.Time
+}
+
+var (
+	authLockMu       sync.Mutex
+	clientAuthRecord = make(map[string]*clientAuthStatus)
+)
+
+func getClientIP(r *http.Request) string {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+func checkAuthLockout(clientIP string) (bool, time.Duration, int) {
+	authLockMu.Lock()
+	defer authLockMu.Unlock()
+
+	status, exists := clientAuthRecord[clientIP]
+	if !exists {
+		return false, 0, authMaxAttempts
+	}
+
+	if status.failedCount >= authMaxAttempts {
+		now := time.Now()
+		if now.Before(status.lockUntil) {
+			return true, status.lockUntil.Sub(now), 0
+		}
+		delete(clientAuthRecord, clientIP)
+		return false, 0, authMaxAttempts
+	}
+
+	return false, 0, authMaxAttempts - status.failedCount
+}
+
+func recordAuthFailure(clientIP string) (bool, time.Duration, int) {
+	authLockMu.Lock()
+	defer authLockMu.Unlock()
+
+	status, exists := clientAuthRecord[clientIP]
+	if !exists {
+		status = &clientAuthStatus{}
+		clientAuthRecord[clientIP] = status
+	}
+
+	status.failedCount++
+	if status.failedCount >= authMaxAttempts {
+		status.lockUntil = time.Now().Add(authLockoutDuration)
+		return true, authLockoutDuration, 0
+	}
+
+	return false, 0, authMaxAttempts - status.failedCount
+}
+
+func recordAuthSuccess(clientIP string) {
+	authLockMu.Lock()
+	delete(clientAuthRecord, clientIP)
+	authLockMu.Unlock()
+}
+
+func getAuthToken(pwd string) string {
+	sum := sha256.Sum256([]byte("dsh_tavern_auth_salt:" + pwd))
+	return hex.EncodeToString(sum[:])
+}
+
+func isValidAuthCookie(r *http.Request, pwd string) bool {
+	expectedToken := getAuthToken(pwd)
+	// 优先检查新 session cookie
+	if c, err := r.Cookie(authCookieName); err == nil && c.Value != "" {
+		if c.Value == expectedToken || c.Value == pwd {
+			return true
+		}
+	}
+	// 兼容旧 auth cookie
+	if c, err := r.Cookie(authLegacyCookie); err == nil && c.Value != "" {
+		if c.Value == expectedToken || c.Value == pwd {
+			return true
+		}
+	}
+	return false
+}
+
+// proxyWithAuth 密码中间件
+func proxyWithAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		pwd := GetConfig().AccessPassword
+		if pwd == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		clientIP := getClientIP(r)
+		isLocked, lockRemaining, remainingAttempts := checkAuthLockout(clientIP)
+
+		// 处理登录验证请求
+		if r.URL.Path == authLoginPath && r.Method == http.MethodPost {
+			isJSONReq := strings.Contains(r.Header.Get("Content-Type"), "application/json") ||
+				strings.Contains(r.Header.Get("Accept"), "application/json")
+
+			if isLocked {
+				mins := int(lockRemaining.Minutes()) + 1
+				if isJSONReq {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"code":        http.StatusTooManyRequests,
+						"locked":      true,
+						"remain_mins": mins,
+						"message":     fmt.Sprintf("密码错误达 3 次已锁定，请等待约 %d 分钟或重启服务", mins),
+					})
+					return
+				}
+				serveLoginPage(w, isLocked, lockRemaining, 0)
+				return
+			}
+
+			// 获取输入的密码
+			inputPwd := ""
+			if isJSONReq {
+				var reqBody struct {
+					Password string `json:"password"`
+				}
+				bodyBytes, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(bodyBytes, &reqBody)
+				inputPwd = reqBody.Password
+			} else {
+				_ = r.ParseForm()
+				inputPwd = r.FormValue("password")
+			}
+
+			if inputPwd == pwd {
+				recordAuthSuccess(clientIP)
+				token := getAuthToken(pwd)
+				cookie := &http.Cookie{
+					Name:     authCookieName,
+					Value:    token,
+					Path:     "/",
+					MaxAge:   86400 * 30, // 30天有效
+					Expires:  time.Now().Add(30 * 24 * time.Hour),
+					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
+				}
+				http.SetCookie(w, cookie)
+
+				if isJSONReq {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"code":     0,
+						"message":  "success",
+						"token":    token,
+						"redirect": "/",
+					})
+					return
+				}
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+			} else {
+				lockedNow, remDuration, remAttempts := recordAuthFailure(clientIP)
+				if isJSONReq {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					status := http.StatusUnauthorized
+					msg := fmt.Sprintf("密码错误，还可尝试 %d 次", remAttempts)
+					if lockedNow {
+						status = http.StatusTooManyRequests
+						mins := int(remDuration.Minutes()) + 1
+						msg = fmt.Sprintf("密码错误达 3 次已锁定，请等待约 %d 分钟或重启服务", mins)
+					}
+					w.WriteHeader(status)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"code":               status,
+						"locked":             lockedNow,
+						"remaining_attempts": remAttempts,
+						"message":            msg,
+					})
+					return
+				}
+				serveLoginPage(w, lockedNow, remDuration, remAttempts)
+			}
+			return
+		}
+
+		// 放行公开静态元数据（避免 PWA 清单与图标因浏览器默认无凭证请求而触发登录页拦截）
+		if r.URL.Path == "/manifest.webmanifest" || r.URL.Path == "/favicon.svg" || r.URL.Path == "/pwa-icon.svg" {
+			if r.URL.Path == "/pwa-icon.svg" && len(pwaIconSvgBytes) > 0 {
+				w.Header().Set("Content-Type", "image/svg+xml")
+				w.Header().Set("Cache-Control", "public, max-age=86400")
+				_, _ = w.Write(pwaIconSvgBytes)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 校验 cookie
+		if !isValidAuthCookie(r, pwd) {
+			serveLoginPage(w, isLocked, lockRemaining, remainingAttempts)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func serveLoginPage(w http.ResponseWriter, isLocked bool, lockRemaining time.Duration, remainingAttempts int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	var errorHTML template.HTML
+	buttonText := "进入"
+
+	if isLocked {
+		w.WriteHeader(http.StatusTooManyRequests)
+		mins := int(lockRemaining.Minutes()) + 1
+		errorHTML = template.HTML(fmt.Sprintf(`<div class="err" id="errMsg">
+      <svg width="15" height="15" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+      </svg>
+      <span id="errText">密码错误达 3 次已锁定，请等待约 %d 分钟或重启服务</span>
+    </div>`, mins))
+		buttonText = "已锁定冷却中"
+	} else if remainingAttempts < authMaxAttempts {
+		w.WriteHeader(http.StatusUnauthorized)
+		errorHTML = template.HTML(fmt.Sprintf(`<div class="err" id="errMsg">
+      <svg width="15" height="15" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+      </svg>
+      <span id="errText">密码错误，还可尝试 %d 次</span>
+    </div>`, remainingAttempts))
+	}
+
+	data := struct {
+		IsLocked      bool
+		ButtonText    string
+		ErrorHTML     template.HTML
+		AuthLoginPath string
+	}{
+		IsLocked:      isLocked,
+		ButtonText:    buttonText,
+		ErrorHTML:     errorHTML,
+		AuthLoginPath: authLoginPath,
+	}
+
+	_ = authLoginPageTpl.Execute(w, data)
+}
+
+var (
+	proxyMu     sync.Mutex
+	proxyHTTP   *http.Server
+	proxyHTTPS  *http.Server
+	proxyCmux   cmux.CMux
+	proxyTarget *url.URL
+	proxyAddr   string
+	proxyTLS    *tls.Config
+)
+
+func updateReverseProxyTarget() {
+	cfg := GetConfig()
+	proxyTarget, _ = url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cfg.GetServerPort()))
+	proxyAddr = fmt.Sprintf("0.0.0.0:%d", cfg.GetProxyPort())
+}
+
+func listAllDNSNames() []string {
+	names := []string{"localhost", "dsh-tavern"}
+	if hostname, err := os.Hostname(); err == nil && hostname != "" && hostname != "localhost" {
+		names = append(names, hostname)
+	}
+	return names
+}
+
+func generateSelfSignedCert(certPath, keyPath string) error {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("生成 ECDSA 密钥失败: %s", err)
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return fmt.Errorf("生成序列号失败: %s", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"DSH Tavern"},
+			CommonName:   "dsh-tavern",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Minute),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              listAllDNSNames(),
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return fmt.Errorf("创建证书失败: %s", err)
+	}
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		return fmt.Errorf("写入证书文件失败: %s", err)
+	}
+	defer certOut.Close()
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes}); err != nil {
+		return fmt.Errorf("PEM 编码证书失败: %s", err)
+	}
+
+	keyOut, err := os.Create(keyPath)
+	if err != nil {
+		return fmt.Errorf("写入密钥文件失败: %s", err)
+	}
+	defer keyOut.Close()
+	privBytes, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return fmt.Errorf("序列化私钥失败: %s", err)
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes}); err != nil {
+		return fmt.Errorf("PEM 编码私钥失败: %s", err)
+	}
+
+	LogInfo("TLS 自签名证书已就绪: %s", certPath)
+	return nil
+}
+
+func loadOrCreateProxyTLS() (*tls.Config, error) {
+	autoDir := globalPkgVar
+	if autoDir == "" {
+		autoDir = "."
+	}
+	certFile := filepath.Join(autoDir, "dsh-tavern.crt")
+	keyFile := filepath.Join(autoDir, "dsh-tavern.key")
+
+	needRegen := false
+	if _, err := os.Stat(certFile); os.IsNotExist(err) {
+		needRegen = true
+	} else if _, err := os.Stat(keyFile); os.IsNotExist(err) {
+		needRegen = true
+	}
+
+	if needRegen {
+		if err := generateSelfSignedCert(certFile, keyFile); err != nil {
+			return nil, fmt.Errorf("生成自签名证书失败: %s", err)
+		}
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("加载 TLS 证书失败: %s", err)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+func startReverseProxy() error {
+	proxyMu.Lock()
+	defer proxyMu.Unlock()
+	return startReverseProxyLocked()
+}
+
+func startReverseProxyLocked() error {
+	if proxyHTTP != nil || proxyHTTPS != nil {
+		return nil
+	}
+
+	updateReverseProxyTarget()
+
+	tlsCfg, err := loadOrCreateProxyTLS()
+	if err != nil {
+		LogWarning("TLS 证书加载失败，反向代理未启动: %s", err)
+		return err
+	}
+	proxyTLS = tlsCfg
+
+	errHandler := func(w http.ResponseWriter, r *http.Request, err error) {
+		// 过滤客户端主动断开连接/取消请求的正常行为
+		if errors.Is(err, context.Canceled) || errors.Is(r.Context().Err(), context.Canceled) || strings.Contains(err.Error(), "context canceled") {
+			return
+		}
+		LogWarning("反向代理转发错误 [%s]: %s", proxyAddr, err)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "bad_gateway",
+			"message": proxyErrMessage(),
+			"detail":  err.Error(),
+		})
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(proxyTarget)
+			// DSH's bundle route intentionally uses a second '?' in RawQuery.
+			// ReverseProxy sanitizes that query before Rewrite, so restore it verbatim.
+			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+			pr.SetXForwarded()
+			// 统一回环 Host 标头，保证上游计算的 authority 恒定
+			pr.Out.Host = proxyTarget.Host
+			pr.Out.Header.Set("Host", proxyTarget.Host)
+			// 改写为目标同源 Origin，保留标头供插件使用并防止上游 CSRF 校验失败
+			if pr.Out.Header.Get("Origin") != "" {
+				pr.Out.Header.Set("Origin", fmt.Sprintf("%s://%s", proxyTarget.Scheme, proxyTarget.Host))
+			}
+			// 改写为 same-origin，防止跨站/iframe 标记被上游拦截并保留标头
+			if pr.Out.Header.Get("Sec-Fetch-Site") != "" {
+				pr.Out.Header.Set("Sec-Fetch-Site", "same-origin")
+			}
+			// 禁用压缩以便代理层注入 Polyfill
+			pr.Out.Header.Set("Accept-Encoding", "identity")
+
+			// 若访问根路径且未携带官方会话 Cookie，自动注入 Launch Token 换取会话
+			p := pr.Out.URL.Path
+			if (p == "" || p == "/" || p == "/index.html") && !hasDshAuthCookie(pr.In.Header.Get("Cookie")) {
+				if token := GetCurrentLaunchToken(); token != "" && !pr.Out.URL.Query().Has("token") {
+					q := pr.Out.URL.Query()
+					q.Set("token", token)
+					pr.Out.URL.RawQuery = q.Encode()
+				}
+			}
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// 拦截 401 鉴权失败，若具备新 Token 则自动重定向刷新换票
+			if resp.StatusCode == http.StatusUnauthorized {
+				if token := GetCurrentLaunchToken(); token != "" {
+					bodyBytes, err := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					if err == nil && strings.Contains(string(bodyBytes), "dsh web authentication required") {
+						// 防环检查：若当前请求已携带该 Token，或短时间内已尝试过换票，禁止再次重定向以彻底阻断死循环
+						hasSameToken := resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.Query().Get("token") == token
+						hasExchCookie := false
+						if resp.Request != nil {
+							if reqCookie := resp.Request.Header.Get("Cookie"); reqCookie != "" {
+								for _, part := range strings.Split(reqCookie, ";") {
+									if strings.TrimSpace(part) == dshExchangeCookie+"=1" {
+										hasExchCookie = true
+										break
+									}
+								}
+							}
+						}
+						if !hasSameToken && !hasExchCookie {
+							resp.StatusCode = http.StatusSeeOther
+							resp.Header.Set("Location", fmt.Sprintf("/?token=%s", url.QueryEscape(token)))
+							resp.Header.Set("Cache-Control", "no-store")
+							resp.Header.Del("Content-Length")
+							// 标记本次已触发换票重定向，5 秒内禁止再次自动发起重定向换票
+							resp.Header.Add("Set-Cookie", fmt.Sprintf("%s=1; Path=/; Max-Age=5; HttpOnly; SameSite=Lax", dshExchangeCookie))
+							// 清理客户端携带的失效官方 Cookie，避免重定向后持续冲突
+							if resp.Request != nil {
+								if reqCookie := resp.Request.Header.Get("Cookie"); reqCookie != "" {
+									clearDshAuthCookies(resp.Header, reqCookie, "/")
+								}
+							}
+							resp.Body = io.NopCloser(bytes.NewReader(nil))
+							resp.ContentLength = 0
+							return nil
+						}
+						// 若已发生过换票重定向依然 401，清理换票标记并放行错误，彻底防止死循环
+						if hasExchCookie {
+							resp.Header.Add("Set-Cookie", fmt.Sprintf("%s=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax", dshExchangeCookie))
+						}
+					}
+					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				}
+			}
+
+			// 改写上游重定向地址，去除回环主机头防止协议漂移
+			if loc := resp.Header.Get("Location"); loc != "" {
+				if u, err := url.Parse(loc); err == nil && u.Host != "" {
+					if strings.HasPrefix(u.Host, "127.0.0.1") || strings.HasPrefix(u.Host, "localhost") {
+						u.Scheme = ""
+						u.Host = ""
+						resp.Header.Set("Location", u.String())
+					}
+				}
+			}
+
+			contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+
+			// 处理 SSE 流式响应标头
+			if strings.HasPrefix(contentType, "text/event-stream") {
+				resp.Header.Set("Cache-Control", "no-cache, no-transform")
+				resp.Header.Set("X-Accel-Buffering", "no")
+				resp.Header.Del("Content-Length")
+				return nil
+			}
+
+			// 拦截 HTML 注入 Polyfill 修复非安全上下文环境
+			if strings.Contains(contentType, "text/html") && resp.Body != nil {
+				bodyBytes, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err != nil {
+					return err
+				}
+
+				modified := injectHtmlPolyfill(bodyBytes)
+				resp.Body = io.NopCloser(bytes.NewReader(modified))
+				resp.ContentLength = int64(len(modified))
+				resp.Header.Set("Content-Length", strconv.Itoa(len(modified)))
+			}
+
+			// 拦截并改写 PWA Web App Manifest 的应用图标路径
+			if (strings.Contains(contentType, "manifest+json") || (resp.Request != nil && strings.HasSuffix(resp.Request.URL.Path, ".webmanifest"))) && resp.Body != nil {
+				bodyBytes, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err == nil {
+					modified := rewriteProxyManifest(bodyBytes)
+					resp.Body = io.NopCloser(bytes.NewReader(modified))
+					resp.ContentLength = int64(len(modified))
+					resp.Header.Set("Content-Length", strconv.Itoa(len(modified)))
+					resp.Header.Set("Content-Type", "application/manifest+json; charset=utf-8")
+				}
+			}
+
+			return nil
+		},
+		ErrorHandler: errHandler,
+	}
+
+	// 建立 TCP 监听器
+	ln, err := net.Listen("tcp", proxyAddr)
+	if err != nil {
+		LogWarning("反向代理端口监听失败 [%s]: %s", proxyAddr, err)
+		return err
+	}
+
+	// cmux 协议分发
+	mx := cmux.New(ln)
+	tlsL := mx.Match(cmux.TLS())
+	httpL := mx.Match(cmux.Any())
+
+	proxyCmux = mx
+	proxyHTTPS = &http.Server{Handler: proxyWithAuth(proxy), TLSConfig: tlsCfg}
+	proxyHTTP = &http.Server{Handler: proxyWithAuth(proxy)}
+
+	LogInfo("Web 服务就绪探测通过，反向代理启动完成 [%s → %s]", proxyAddr, proxyTarget.String())
+
+	go func() {
+		if err := proxyHTTPS.ServeTLS(tlsL, "", ""); err != nil && !isExpectedCloseErr(err) {
+			LogWarning("HTTPS 代理服务异常退出: %s", err)
+		}
+	}()
+	go func() {
+		if err := proxyHTTP.Serve(httpL); err != nil && !isExpectedCloseErr(err) {
+			LogWarning("HTTP 代理服务异常退出: %s", err)
+		}
+	}()
+	go func() {
+		if err := mx.Serve(); err != nil && !isExpectedCloseErr(err) {
+			LogWarning("cmux 协议多路复用器退出: %s", err)
+		}
+	}()
+
+	return nil
+}
+
+func isExpectedCloseErr(err error) bool {
+	if err == nil || err == http.ErrServerClosed || err == net.ErrClosed || err == cmux.ErrListenerClosed || err == cmux.ErrServerClosed || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "server closed") ||
+		strings.Contains(msg, "closed network connection") ||
+		strings.Contains(msg, "context canceled")
+}
+
+func stopReverseProxy() {
+	proxyMu.Lock()
+	defer proxyMu.Unlock()
+	stopReverseProxyLocked()
+}
+
+func stopReverseProxyLocked() {
+	if proxyHTTP == nil && proxyHTTPS == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if proxyHTTPS != nil {
+		_ = proxyHTTPS.Shutdown(ctx)
+		proxyHTTPS = nil
+	}
+	if proxyHTTP != nil {
+		_ = proxyHTTP.Shutdown(ctx)
+		proxyHTTP = nil
+	}
+	if proxyCmux != nil {
+		proxyCmux.Close()
+		proxyCmux = nil
+	}
+	LogInfo("反向代理服务已停止")
+}
+
+// proxyErrMessage 根据当前服务状态给出准确的代理错误提示
+func proxyErrMessage() string {
+	switch state.Status() {
+	case StatusStarting:
+		return "服务正在启动"
+	case StatusRunning:
+		return "服务响应异常"
+	case StatusBuilding:
+		return "服务正在部署更新"
+	case StatusSnapshotting:
+		return "服务快照维护中"
+	case StatusStopped:
+		return "服务未运行"
+	default:
+		return "无法连接到后端服务"
+	}
+}
+
+// restartReverseProxy 按最新配置重启反向代理
+func restartReverseProxy() {
+	proxyMu.Lock()
+	defer proxyMu.Unlock()
+	stopReverseProxyLocked()
+	if state.Status() != StatusRunning {
+		return
+	}
+	LogInfo("反向代理配置已变更，执行热重载")
+	if err := startReverseProxyLocked(); err != nil {
+		LogWarning("反向代理热重载失败: %s", err)
+	}
+}
+
+const httpPolyfillScript = `<style>[data-slot="settings.action"] { display: none !important; }</style><script>(function(){
+  try{window.__DSH_TRANSPORT__=Object.assign(window.__DSH_TRANSPORT__||{},{ownsHost:true});}catch(_){}
+  var c=window.crypto;
+  if(c&&typeof c.randomUUID!=="function"&&typeof c.getRandomValues==="function"){
+    var getRand=c.getRandomValues.bind(c);
+    var uuid=function(){
+      var b=new Uint8Array(16);
+      getRand(b);
+      b[6]=(b[6]&15)|64;
+      b[8]=(b[8]&63)|128;
+      var h=Array.from(b,function(x){return("0"+x.toString(16)).slice(-2);}).join("");
+      return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20);
+    };
+    var install=function(target){
+      try{Object.defineProperty(target,"randomUUID",{configurable:true,writable:true,value:uuid});return typeof target.randomUUID==="function";}catch(_){return false;}
+    };
+    if(!install(c)&&Object.getPrototypeOf(c))install(Object.getPrototypeOf(c));
+  }
+
+  var hookModuleLoader = function (loader) {
+    if (!loader || typeof loader.load !== "function" || loader.__hooked) return loader;
+    var rawLoad = loader.load.bind(loader);
+    loader.load = function (handoff) {
+      if (handoff && handoff.id === "@deepseek-ai/dsh-client-connection" && typeof handoff.factory === "function") {
+        var rawFactory = handoff.factory;
+        handoff.factory = function () {
+          var modExports = rawFactory.apply(this, arguments);
+          if (modExports && typeof modExports.apply === "function") {
+            var rawApply = modExports.apply;
+            modExports.apply = function (ctx) {
+              if (ctx && typeof ctx.provide === "function") {
+                var proxyCtx = new Proxy(ctx, {
+                  get: function (target, prop, receiver) {
+                    if (prop === "provide") {
+                      return function (name, handle) {
+                        if (name === "connection" && handle && typeof handle === "object") {
+                          try {
+                            Object.defineProperty(handle, "isLoopback", {
+                              value: true,
+                              writable: true,
+                              configurable: true
+                            });
+                          } catch (_) {
+                            handle.isLoopback = true;
+                          }
+                        }
+                        return Reflect.apply(target.provide, target, arguments);
+                      };
+                    }
+                    return Reflect.get(target, prop, receiver);
+                  }
+                });
+                return rawApply.call(this, proxyCtx);
+              }
+              return rawApply.apply(this, arguments);
+            };
+          }
+          return modExports;
+        };
+      }
+      return rawLoad(handoff);
+    };
+    loader.__hooked = true;
+    return loader;
+  };
+  if (window.__ModuleLoader__) {
+    hookModuleLoader(window.__ModuleLoader__);
+  } else {
+    var storedLoader = undefined;
+    try {
+      Object.defineProperty(window, "__ModuleLoader__", {
+        configurable: true,
+        enumerable: true,
+        get: function () { return storedLoader; },
+        set: function (val) {
+          storedLoader = hookModuleLoader(val);
+        }
+      });
+    } catch (_) {}
+  }
+})();</script>`
+
+// injectHtmlPolyfill 将兼容补丁注入 HTML 的 head 头部
+func injectHtmlPolyfill(body []byte) []byte {
+	return injectHtmlHead(body, []byte(httpPolyfillScript))
+}
+
+// hasDshAuthCookie 判断 Cookie 标头是否包含官方 dsh-auth- 会话凭证（且具备非空有效值）
+func hasDshAuthCookie(cookieHeader string) bool {
+	if cookieHeader == "" {
+		return false
+	}
+	for _, part := range strings.Split(cookieHeader, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "dsh-auth-") {
+			if idx := strings.IndexByte(part, '='); idx != -1 {
+				if strings.TrimSpace(part[idx+1:]) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// clearDshAuthCookies 在响应中写入清除失效官方会话凭据的 Set-Cookie 标头
+func clearDshAuthCookies(header http.Header, cookieHeader string, paths ...string) {
+	if cookieHeader == "" {
+		return
+	}
+	if len(paths) == 0 {
+		paths = []string{"/"}
+	}
+	for _, part := range strings.Split(cookieHeader, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "dsh-auth-") {
+			if idx := strings.IndexByte(part, '='); idx != -1 {
+				name := strings.TrimSpace(part[:idx])
+				for _, p := range paths {
+					header.Add("Set-Cookie", fmt.Sprintf("%s=; Path=%s; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax", name, p))
+					header.Add("Set-Cookie", fmt.Sprintf("%s=; Path=%s; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=None; Secure", name, p))
+				}
+			}
+		}
+	}
+}
+
+// rewriteProxyManifest 注入修改 PWA manifest 中的应用图标为 /pwa-icon.svg
+func rewriteProxyManifest(body []byte) []byte {
+	var manifest map[string]any
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return body
+	}
+	if icons, ok := manifest["icons"].([]any); ok {
+		for _, ic := range icons {
+			if icMap, ok := ic.(map[string]any); ok {
+				icMap["src"] = "/pwa-icon.svg"
+			}
+		}
+	}
+	newBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return body
+	}
+	return newBytes
+}
