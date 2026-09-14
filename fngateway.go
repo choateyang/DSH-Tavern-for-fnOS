@@ -35,6 +35,49 @@ func InitFnGateway(base *gin.RouterGroup) {
 	base.Any("/fngateway/*action", handleFnGateway)
 }
 
+// gatewayBackendPath converts either the public or fnOS-relative gateway path
+// to the path expected by the Tavern HTTP server.
+func gatewayBackendPath(path string) string {
+	for _, prefix := range []string{fnGatewayPrefix, "/fngateway"} {
+		switch {
+		case path == prefix:
+			return "/"
+		case strings.HasPrefix(path, prefix+"/"):
+			path = strings.TrimPrefix(path, prefix)
+		}
+	}
+	if path == "" {
+		return "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
+}
+
+// restoreDshComboQuery restores the second '?' used by DSH's plugin bundle
+// protocol when an intermediary normalized it away.
+func restoreDshComboQuery(path, rawQuery string) string {
+	if (path != "/plugins/" && path != "/plugins") || rawQuery == "" || strings.HasPrefix(rawQuery, "?") {
+		return rawQuery
+	}
+	if !strings.Contains(rawQuery, "client.js") || !strings.Contains(rawQuery, "rev=") {
+		return rawQuery
+	}
+	return "?" + rawQuery
+}
+
+func rewriteFnGatewayURL(inURL, outURL *url.URL) {
+	p := gatewayBackendPath(inURL.Path)
+	outURL.Path = p
+	if inURL.RawPath != "" {
+		outURL.RawPath = gatewayBackendPath(inURL.RawPath)
+	} else {
+		outURL.RawPath = ""
+	}
+	outURL.RawQuery = restoreDshComboQuery(p, inURL.RawQuery)
+}
+
 // handleFnGateway 飞牛网关核心反向代理处理器
 func handleFnGateway(c *gin.Context) {
 	// 获取后端监听端口
@@ -46,23 +89,13 @@ func handleFnGateway(c *gin.Context) {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(targetURL)
 			// DSH's bundle route intentionally uses a second '?' in RawQuery.
-			// ReverseProxy sanitizes that query before Rewrite, so restore it verbatim.
-			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+			// ReverseProxy sanitizes that query before Rewrite, so restore it here.
+			rewriteFnGatewayURL(pr.In.URL, pr.Out.URL)
 			pr.SetXForwarded()
 
-			// 剥除网关前缀
-			p := strings.TrimPrefix(pr.Out.URL.Path, fnGatewayPrefix)
-			if !strings.HasPrefix(p, "/") {
-				p = "/" + p
-			}
-			pr.Out.URL.Path = p
-			if pr.Out.URL.RawPath != "" {
-				rawP := strings.TrimPrefix(pr.Out.URL.RawPath, fnGatewayPrefix)
-				if !strings.HasPrefix(rawP, "/") {
-					rawP = "/" + rawP
-				}
-				pr.Out.URL.RawPath = rawP
-			}
+			// fnOS may forward either the public path or the path relative to the
+			// application's gateway prefix. Always derive this from the inbound URL.
+			p := pr.Out.URL.Path
 
 			// 改写回环请求头与安全上下文
 			pr.Out.Host = fmt.Sprintf("127.0.0.1:%d", serverPort)

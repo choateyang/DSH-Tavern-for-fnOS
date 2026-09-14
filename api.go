@@ -28,6 +28,10 @@ func InitRoutes(r *gin.Engine) {
 
 	// 注册飞牛网关直连 WebUI 代理路由
 	InitFnGateway(base)
+	// fnOS versions differ in whether gatewaySocket requests retain the
+	// application prefix before reaching the Unix Socket.
+	r.Any("/fngateway", handleFnGateway)
+	r.Any("/fngateway/*action", handleFnGateway)
 
 	api := base.Group("/api")
 	{
